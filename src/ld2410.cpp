@@ -413,6 +413,13 @@ bool ld2410::parse_data_frame_() {
     }
 
     // Tabella 12: dati basic (presenti sia in 0x01 che in 0x02)
+    // Sezione critica: su ESP32 dual-core il task pinnato a core 0 può aggiornare
+    // i campi mentre il loop utente li legge da core 1. Il critical section
+    // evita stati inconsistenti tra campi di uno stesso frame e funge da
+    // memory barrier per i lettori dei singoli getter.
+#if defined(ESP32)
+    portENTER_CRITICAL(&data_mux_);
+#endif
     target_type_ = radar_data_frame_[8];
     moving_target_distance_ = *(uint16_t*)(&radar_data_frame_[9]);
     moving_target_energy_ = radar_data_frame_[11];
@@ -436,6 +443,9 @@ bool ld2410::parse_data_frame_() {
 
     last_valid_frame_length = radar_data_frame_position_;
     radar_uart_last_packet_ = millis();
+#if defined(ESP32)
+    portEXIT_CRITICAL(&data_mux_);
+#endif
     return true;
 }
 

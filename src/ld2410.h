@@ -101,6 +101,7 @@ class ld2410	{
 		bool engineering_data_received_ = false;
 #if defined(ESP32)
 		TaskHandle_t taskHandle_ = nullptr;
+		portMUX_TYPE data_mux_ = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
 		uint8_t circular_buffer[LD2410_BUFFER_SIZE];
