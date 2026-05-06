@@ -10,9 +10,11 @@
  * 
  * The serial configuration for other boards will vary and you'll need to assign them yourself
  * 
- * There is no example for ESP8266 as it only has one usable UART and will not boot if the alternate UART pins are used for the radar.
- * 
- * For this sketch and other examples to be useful the board needs to have two usable UARTs.
+ * For ESP8266, see the basicSensorEsp8266 sibling example — it uses
+ * SoftwareSerial because the ESP8266's hardware UARTs cannot host both the
+ * radar and the serial monitor without colliding with strapping pins.
+ *
+ * For this sketch the board needs two usable hardware UARTs.
  * 
  */
 
