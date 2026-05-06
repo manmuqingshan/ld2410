@@ -13,6 +13,10 @@
 #ifndef ld2410_h
 #define ld2410_h
 #include <Arduino.h>
+#if defined(ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 #define LD2410_MAX_FRAME_LENGTH 40
 #ifndef LD2410_BUFFER_SIZE
@@ -62,7 +66,8 @@ class ld2410	{
 		bool setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t stationary);
     	FrameData getFrameData() const;
 #if defined(ESP32)
-		void autoReadTask(uint32_t stack, uint32_t priority, uint32_t core);
+		bool autoReadTask(uint32_t stack = 4096, UBaseType_t priority = 1, BaseType_t core = tskNO_AFFINITY);
+		void stopAutoReadTask();
 #endif
 
 	protected:
@@ -86,6 +91,9 @@ class ld2410	{
 		uint16_t stationary_target_distance_ = 0;
 		uint8_t stationary_target_energy_ = 0;
     	uint16_t last_valid_frame_length = 0;
+#if defined(ESP32)
+		TaskHandle_t taskHandle_ = nullptr;
+#endif
 
 		uint8_t circular_buffer[LD2410_BUFFER_SIZE];
         uint16_t buffer_head = 0;

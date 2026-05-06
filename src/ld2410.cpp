@@ -185,17 +185,35 @@ void ld2410::taskFunction(void* param) {
     }
 }
 
-// Funzione per avviare il task
-void ld2410::autoReadTask(uint32_t stack, uint32_t priority, uint32_t core) {
-    xTaskCreatePinnedToCore(
+// Avvia il task FreeRTOS che legge in continuo dalla UART del radar.
+// Ritorna true se il task è stato creato con successo. Se un task era già
+// attivo viene ignorata la nuova richiesta e si ritorna true.
+bool ld2410::autoReadTask(uint32_t stack, UBaseType_t priority, BaseType_t core) {
+    if (taskHandle_ != nullptr) {
+        return true;
+    }
+    BaseType_t result = xTaskCreatePinnedToCore(
         taskFunction,
         "LD2410Task",
         stack,
         this,
         priority,
-        nullptr,
+        &taskHandle_,
         core
     );
+    if (result != pdPASS) {
+        taskHandle_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Ferma il task se in esecuzione.
+void ld2410::stopAutoReadTask() {
+    if (taskHandle_ != nullptr) {
+        vTaskDelete(taskHandle_);
+        taskHandle_ = nullptr;
+    }
 }
 #endif
 
