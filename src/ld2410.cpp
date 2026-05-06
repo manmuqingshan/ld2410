@@ -164,6 +164,7 @@ bool ld2410::read() {
 }
 
 
+#if defined(ESP32)
 void ld2410::taskFunction(void* param) {
     ld2410* sensor = static_cast<ld2410*>(param);
     for (;;) {
@@ -196,6 +197,7 @@ void ld2410::autoReadTask(uint32_t stack, uint32_t priority, uint32_t core) {
         core
     );
 }
+#endif
 
 
 bool ld2410::presenceDetected()

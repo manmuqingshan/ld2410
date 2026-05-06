@@ -61,7 +61,9 @@ class ld2410	{
 		bool setMaxValues(uint16_t moving, uint16_t stationary, uint16_t inactivityTimer);	//Realistically gate values are 0-8 but sent as uint16_t
 		bool setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t stationary);
     	FrameData getFrameData() const;
+#if defined(ESP32)
 		void autoReadTask(uint32_t stack, uint32_t priority, uint32_t core);
+#endif
 
 	protected:
 	private:
@@ -104,6 +106,8 @@ class ld2410	{
 		void send_command_postamble_();									//Commands have the same postamble
 		bool enter_configuration_mode_();								//Necessary before sending any command
 		bool leave_configuration_mode_();								//Will not read values without leaving command mode
+#if defined(ESP32)
 		static void taskFunction(void* param);
+#endif
 };
 #endif
