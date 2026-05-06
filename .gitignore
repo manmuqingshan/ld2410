@@ -31,6 +31,9 @@
 *.out
 *.app
 
+# Tests build artifacts
+tests/test_parser
+
 # Arduino
 .development
 examples/basicSensor/debug.cfg
