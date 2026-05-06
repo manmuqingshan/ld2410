@@ -164,6 +164,7 @@ bool ld2410::read() {
 }
 
 
+#if defined(ESP32)
 void ld2410::taskFunction(void* param) {
     ld2410* sensor = static_cast<ld2410*>(param);
     for (;;) {
@@ -184,18 +185,37 @@ void ld2410::taskFunction(void* param) {
     }
 }
 
-// Funzione per avviare il task
-void ld2410::autoReadTask(uint32_t stack, uint32_t priority, uint32_t core) {
-    xTaskCreatePinnedToCore(
+// Avvia il task FreeRTOS che legge in continuo dalla UART del radar.
+// Ritorna true se il task è stato creato con successo. Se un task era già
+// attivo viene ignorata la nuova richiesta e si ritorna true.
+bool ld2410::autoReadTask(uint32_t stack, UBaseType_t priority, BaseType_t core) {
+    if (taskHandle_ != nullptr) {
+        return true;
+    }
+    BaseType_t result = xTaskCreatePinnedToCore(
         taskFunction,
         "LD2410Task",
         stack,
         this,
         priority,
-        nullptr,
+        &taskHandle_,
         core
     );
+    if (result != pdPASS) {
+        taskHandle_ = nullptr;
+        return false;
+    }
+    return true;
 }
+
+// Ferma il task se in esecuzione.
+void ld2410::stopAutoReadTask() {
+    if (taskHandle_ != nullptr) {
+        vTaskDelete(taskHandle_);
+        taskHandle_ = nullptr;
+    }
+}
+#endif
 
 
 bool ld2410::presenceDetected()
@@ -255,6 +275,27 @@ uint8_t ld2410::movingTargetEnergy() {
     return moving_target_energy_;  // Restituisci il valore se è già compreso tra 0 e 100
 }
 
+uint16_t ld2410::detectionDistance() {
+    return detection_distance_;
+}
+
+uint8_t ld2410::movingEnergyAtGate(uint8_t gate) {
+    if (gate >= 9) {
+        return 0;
+    }
+    return engineering_motion_energy_[gate];
+}
+
+uint8_t ld2410::stationaryEnergyAtGate(uint8_t gate) {
+    if (gate >= 9) {
+        return 0;
+    }
+    return engineering_stationary_energy_[gate];
+}
+
+bool ld2410::engineeringRetrieved() {
+    return engineering_data_received_;
+}
 
 
 bool ld2410::check_frame_end_() {
@@ -349,29 +390,63 @@ bool ld2410::read_frame_() {
 bool ld2410::parse_data_frame_() {
     uint16_t intra_frame_data_length = radar_data_frame_[4] | (radar_data_frame_[5] << 8);
 
-    // Verifica se la lunghezza del frame è corretta
+    // Frame totale = header(4) + length(2) + intra-frame + footer(4) = intra+10
     if (radar_data_frame_position_ != intra_frame_data_length + 10) {
         return false;
     }
 
-    // Controllo dei byte specifici per validare il frame
-    if (radar_data_frame_[6] == 0x02 && radar_data_frame_[7] == 0xAA &&
-        radar_data_frame_[17] == 0x55 && radar_data_frame_[18] == 0x00) {
-
-        target_type_ = radar_data_frame_[8];
-
-        // Estrai distanze e energie dei bersagli
-        stationary_target_distance_ = *(uint16_t*)(&radar_data_frame_[12]);
-        moving_target_distance_ = *(uint16_t*)(&radar_data_frame_[9]);
-        stationary_target_energy_ = radar_data_frame_[14];
-        moving_target_energy_ = radar_data_frame_[11];
-
-        last_valid_frame_length = radar_data_frame_position_;  // Aggiunto per tracciare la lunghezza del frame
-        radar_uart_last_packet_ = millis();  // Aggiorna il timestamp dell'ultimo pacchetto
-        return true;
+    // Per Tabella 11, il primo byte intra-frame indica il tipo: 0x02 basic, 0x01 engineering.
+    uint8_t data_type = radar_data_frame_[6];
+    if (data_type != 0x01 && data_type != 0x02) {
+        return false;
     }
 
-    return false;  // Frame non valido
+    // Per Tabella 10, i marker di coda 0x55 0x00 sono SEMPRE gli ultimi 2 byte
+    // dell'intra-frame data: per il basic frame (intra=13) coincidono con [17][18]
+    // ma in engineering la posizione varia. Calcoliamo gli offset dinamicamente.
+    uint16_t tail_index = intra_frame_data_length + 4;        // 0x55
+    uint16_t cal_index = intra_frame_data_length + 5;         // 0x00
+    if (radar_data_frame_[7] != 0xAA ||
+        radar_data_frame_[tail_index] != 0x55 ||
+        radar_data_frame_[cal_index] != 0x00) {
+        return false;
+    }
+
+    // Tabella 12: dati basic (presenti sia in 0x01 che in 0x02)
+    // Sezione critica: su ESP32 dual-core il task pinnato a core 0 può aggiornare
+    // i campi mentre il loop utente li legge da core 1. Il critical section
+    // evita stati inconsistenti tra campi di uno stesso frame e funge da
+    // memory barrier per i lettori dei singoli getter.
+#if defined(ESP32)
+    portENTER_CRITICAL(&data_mux_);
+#endif
+    target_type_ = radar_data_frame_[8];
+    moving_target_distance_ = *(uint16_t*)(&radar_data_frame_[9]);
+    moving_target_energy_ = radar_data_frame_[11];
+    stationary_target_distance_ = *(uint16_t*)(&radar_data_frame_[12]);
+    stationary_target_energy_ = radar_data_frame_[14];
+    detection_distance_ = *(uint16_t*)(&radar_data_frame_[15]);
+
+    // Tabella 14: extra engineering. Layout (full-frame index, 0-based):
+    //   17 = max moving gate N (ridondante con max_moving_gate da requestCurrentConfiguration)
+    //   18 = max stationary gate N
+    //   19..27 = energie motion gate 0..8
+    //   28..36 = energie stationary gate 0..8
+    //   poi M byte di retain + tail/cal (gestiti sopra)
+    if (data_type == 0x01 && intra_frame_data_length >= 33) {
+        for (uint8_t gate = 0; gate < 9; gate++) {
+            engineering_motion_energy_[gate] = radar_data_frame_[19 + gate];
+            engineering_stationary_energy_[gate] = radar_data_frame_[28 + gate];
+        }
+        engineering_data_received_ = true;
+    }
+
+    last_valid_frame_length = radar_data_frame_position_;
+    radar_uart_last_packet_ = millis();
+#if defined(ESP32)
+    portEXIT_CRITICAL(&data_mux_);
+#endif
+    return true;
 }
 
 

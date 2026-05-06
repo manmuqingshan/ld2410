@@ -13,8 +13,12 @@
 #ifndef ld2410_h
 #define ld2410_h
 #include <Arduino.h>
+#if defined(ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
-#define LD2410_MAX_FRAME_LENGTH 40
+#define LD2410_MAX_FRAME_LENGTH 64
 #ifndef LD2410_BUFFER_SIZE
 #define LD2410_BUFFER_SIZE 256
 #endif
@@ -43,6 +47,10 @@ class ld2410	{
 		bool movingTargetDetected();
 		uint16_t movingTargetDistance();
 		uint8_t movingTargetEnergy();
+		uint16_t detectionDistance();									//Last reported detection distance in cm (Table 12, last field)
+		uint8_t movingEnergyAtGate(uint8_t gate);						//Per-gate motion energy from engineering frames (Table 14)
+		uint8_t stationaryEnergyAtGate(uint8_t gate);				//Per-gate stationary energy from engineering frames (Table 14)
+		bool engineeringRetrieved();								//True once at least one engineering-mode data frame has been parsed
 		bool requestFirmwareVersion();									//Request the firmware version
 		uint8_t firmware_major_version = 0;								//Reported major version
 		uint8_t firmware_minor_version = 0;								//Reported minor version
@@ -61,7 +69,10 @@ class ld2410	{
 		bool setMaxValues(uint16_t moving, uint16_t stationary, uint16_t inactivityTimer);	//Realistically gate values are 0-8 but sent as uint16_t
 		bool setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t stationary);
     	FrameData getFrameData() const;
-		void autoReadTask(uint32_t stack, uint32_t priority, uint32_t core);
+#if defined(ESP32)
+		bool autoReadTask(uint32_t stack = 4096, UBaseType_t priority = 1, BaseType_t core = tskNO_AFFINITY);
+		void stopAutoReadTask();
+#endif
 
 	protected:
 	private:
@@ -84,6 +95,14 @@ class ld2410	{
 		uint16_t stationary_target_distance_ = 0;
 		uint8_t stationary_target_energy_ = 0;
     	uint16_t last_valid_frame_length = 0;
+		uint16_t detection_distance_ = 0;
+		uint8_t engineering_motion_energy_[9] = {0,0,0,0,0,0,0,0,0};
+		uint8_t engineering_stationary_energy_[9] = {0,0,0,0,0,0,0,0,0};
+		bool engineering_data_received_ = false;
+#if defined(ESP32)
+		TaskHandle_t taskHandle_ = nullptr;
+		portMUX_TYPE data_mux_ = portMUX_INITIALIZER_UNLOCKED;
+#endif
 
 		uint8_t circular_buffer[LD2410_BUFFER_SIZE];
         uint16_t buffer_head = 0;
@@ -104,6 +123,8 @@ class ld2410	{
 		void send_command_postamble_();									//Commands have the same postamble
 		bool enter_configuration_mode_();								//Necessary before sending any command
 		bool leave_configuration_mode_();								//Will not read values without leaving command mode
+#if defined(ESP32)
 		static void taskFunction(void* param);
+#endif
 };
 #endif
