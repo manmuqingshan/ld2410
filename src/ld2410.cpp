@@ -217,6 +217,17 @@ void ld2410::stopAutoReadTask() {
 }
 #endif
 
+// Reports whether autoReadTask() is currently running. Always false on
+// platforms without the FreeRTOS task path, so consumer code can branch on
+// runtime mode without compile-time #ifs.
+bool ld2410::isAutoReadTaskRunning() {
+#if defined(ESP32)
+    return taskHandle_ != nullptr;
+#else
+    return false;
+#endif
+}
+
 
 bool ld2410::presenceDetected()
 {

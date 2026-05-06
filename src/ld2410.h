@@ -69,6 +69,7 @@ class ld2410	{
 		bool setMaxValues(uint16_t moving, uint16_t stationary, uint16_t inactivityTimer);	//Realistically gate values are 0-8 but sent as uint16_t
 		bool setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t stationary);
     	FrameData getFrameData() const;
+		bool isAutoReadTaskRunning();									//True iff autoReadTask() succeeded and the task hasn't been stopped (always false on non-ESP32)
 #if defined(ESP32)
 		bool autoReadTask(uint32_t stack = 4096, UBaseType_t priority = 1, BaseType_t core = tskNO_AFFINITY);
 		void stopAutoReadTask();

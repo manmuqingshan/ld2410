@@ -26,6 +26,7 @@ stationaryEnergyAtGate	KEYWORD2
 engineeringRetrieved	KEYWORD2
 autoReadTask	KEYWORD2
 stopAutoReadTask	KEYWORD2
+isAutoReadTaskRunning	KEYWORD2
 
 firmware_major_version	LITERAL1
 firmware_minor_version	LITERAL1
