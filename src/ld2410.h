@@ -69,6 +69,7 @@ class ld2410	{
 		bool setMaxValues(uint16_t moving, uint16_t stationary, uint16_t inactivityTimer);	//Realistically gate values are 0-8 but sent as uint16_t
 		bool setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t stationary);
     	FrameData getFrameData() const;
+		bool isAutoReadTaskRunning();									//True iff autoReadTask() succeeded and the task hasn't been stopped (always false on non-ESP32)
 #if defined(ESP32)
 		bool autoReadTask(uint32_t stack = 4096, UBaseType_t priority = 1, BaseType_t core = tskNO_AFFINITY);
 		void stopAutoReadTask();
@@ -80,7 +81,6 @@ class ld2410	{
 		Stream *debug_uart_ = nullptr;									//The stream used for the debugging
 		uint32_t radar_uart_timeout = 100;								//How long to give up on receiving some useful data from the LD2410
 		uint32_t radar_uart_last_packet_ = 0;							//Time of the last packet from the radar
-		uint32_t radar_uart_last_command_ = 0;							//Time of the last command sent to the radar
 		uint32_t radar_uart_command_timeout_ = 100;						//Timeout for sending commands
 		uint8_t latest_ack_ = 0;
 		bool latest_command_success_ = false;
@@ -99,6 +99,9 @@ class ld2410	{
 		uint8_t engineering_motion_energy_[9] = {0,0,0,0,0,0,0,0,0};
 		uint8_t engineering_stationary_energy_[9] = {0,0,0,0,0,0,0,0,0};
 		bool engineering_data_received_ = false;
+		uint8_t cmd_seq_ = 0;											//Monotonic counter; bumped before each command issue
+		uint8_t cmd_ack_seq_ = 0;										//Mirrored by parser when an ACK matches expected_ack_opcode_
+		uint8_t expected_ack_opcode_ = 0;								//Set by command issuer; checked by parse_command_frame_
 #if defined(ESP32)
 		TaskHandle_t taskHandle_ = nullptr;
 		portMUX_TYPE data_mux_ = portMUX_INITIALIZER_UNLOCKED;
@@ -115,9 +118,10 @@ class ld2410	{
         bool check_frame_end_();
 		
 		bool read_frame_();		
-		bool read_frame_no_buffer_();										//Try to read a frame from the UART
 		bool parse_data_frame_();										//Is the current data frame valid?
 		bool parse_command_frame_();									//Is the current command frame valid?
+		void begin_command_(uint8_t expected_op);						//Bump cmd_seq_, reset stale state, set expected ACK opcode
+		bool wait_for_ack_(uint8_t expected_op, uint32_t timeout_ms);	//Block until matching ACK arrives or timeout
 		void print_frame_();											//Print the frame for debugging
 		void send_command_preamble_();									//Commands have the same preamble
 		void send_command_postamble_();									//Commands have the same postamble

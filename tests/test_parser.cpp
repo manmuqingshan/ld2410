@@ -18,9 +18,22 @@
 #include <cassert>
 #include <initializer_list>
 
+// Mock UART. Two modes:
+//   1. inject(...)            -- bytes are available IMMEDIATELY (used by
+//                                data-frame tests that don't care about
+//                                command/response ordering).
+//   2. inject_response(...)   -- bytes are STAGED and released only when the
+//                                test code observes the radar protocol
+//                                postamble (0x04 0x03 0x02 0x01) being
+//                                written to the UART. This models the real
+//                                radar, which only emits an ACK after it
+//                                has received a complete command.
 class MockSerial : public Stream {
-    std::vector<uint8_t> q_;
+    std::vector<uint8_t> q_;          // bytes available for read()
     size_t pos_ = 0;
+    std::vector<std::vector<uint8_t>> response_queue_;  // staged responses
+    uint8_t last4_[4] = {0};
+    int write_count_ = 0;
 public:
     void inject(std::initializer_list<uint8_t> bytes) {
         q_.insert(q_.end(), bytes.begin(), bytes.end());
@@ -28,12 +41,39 @@ public:
     void inject(const std::vector<uint8_t>& bytes) {
         q_.insert(q_.end(), bytes.begin(), bytes.end());
     }
+    void inject_response(const std::vector<uint8_t>& bytes) {
+        response_queue_.push_back(bytes);
+    }
     int available() override { return (int)(q_.size() - pos_); }
     int read() override {
         if (pos_ >= q_.size()) return -1;
         return q_[pos_++];
     }
-    void clear() { q_.clear(); pos_ = 0; }
+    size_t write(uint8_t b) override {
+        last4_[write_count_ % 4] = b;
+        write_count_++;
+        if (write_count_ >= 4) {
+            // Recover the chronological order of the last 4 writes.
+            uint8_t b0 = last4_[(write_count_ - 4) % 4];
+            uint8_t b1 = last4_[(write_count_ - 3) % 4];
+            uint8_t b2 = last4_[(write_count_ - 2) % 4];
+            uint8_t b3 = last4_[(write_count_ - 1) % 4];
+            if (b0 == 0x04 && b1 == 0x03 && b2 == 0x02 && b3 == 0x01) {
+                if (!response_queue_.empty()) {
+                    const auto& resp = response_queue_.front();
+                    q_.insert(q_.end(), resp.begin(), resp.end());
+                    response_queue_.erase(response_queue_.begin());
+                }
+            }
+        }
+        return 1;
+    }
+    using Print::write;  // pull in the size_t write(const uint8_t*, size_t) overload
+    void clear() {
+        q_.clear(); pos_ = 0;
+        response_queue_.clear();
+        write_count_ = 0;
+    }
 };
 
 static int failures = 0;
@@ -258,12 +298,148 @@ static void test_sequential_frames() {
     std::printf("ok\n");
 }
 
+// ===========================================================================
+// Command-side tests (added by refactor/task-safe-commands).
+// These exercise the wait_for_ack_ + cmd_seq_ machinery via the public
+// request* API. Hardware is not available; we simulate the radar's ACK by
+// pre-loading the MockSerial with the bytes the real radar would send.
+//
+// On the host autoReadTask is not active (no FreeRTOS available), so all
+// commands take the polling branch of wait_for_ack_, which drains UART ->
+// circular buffer -> read_frame_() -> parse_command_frame_() inline.
+// ===========================================================================
+
+// Build a 0xA0 (firmware version) ACK frame with major=1, minor=7, bugfix=0x22091516.
+static std::vector<uint8_t> make_firmware_ack(uint8_t major, uint8_t minor,
+                                              uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    return {
+        0xFD, 0xFC, 0xFB, 0xFA,   // header
+        0x0C, 0x00,               // intra-frame data length = 12
+        0xA0, 0x01,               // command word ACK = 0xA0 | 0x0100 -> LE A0 01
+        0x00, 0x00,               // ACK status: success
+        0x01, 0x00,               // firmware type = 0x0001 LE
+        minor, major,             // bytes 12, 13: minor then major (per parse_command_frame_)
+        b0, b1, b2, b3,           // bugfix uint32 LE
+        0x04, 0x03, 0x02, 0x01    // footer
+    };
+}
+
+// Build a generic short ACK (4-byte payload, status=success) for opcode `op`.
+// Used by enter_configuration_mode_'s ACK (0xFF) and most other commands.
+static std::vector<uint8_t> make_short_ack(uint8_t op, uint16_t intra_len = 4) {
+    std::vector<uint8_t> v = {
+        0xFD, 0xFC, 0xFB, 0xFA,
+        (uint8_t)(intra_len & 0xFF), (uint8_t)((intra_len >> 8) & 0xFF),
+        op, 0x01,                // command word ACK
+        0x00, 0x00               // status: success
+    };
+    // Pad with zero bytes if the caller asked for a longer intra_len so
+    // length matches what the radar would actually send for some commands.
+    for (uint16_t i = 4; i < intra_len; i++) v.push_back(0x00);
+    v.push_back(0x04); v.push_back(0x03); v.push_back(0x02); v.push_back(0x01);
+    return v;
+}
+
+// Test: requestFirmwareVersion full flow.
+// Inject ACKs in the order the real radar would send: enter-config (0xFF),
+// firmware-version (0xA0), leave-config (0xFE). All three must succeed and
+// firmware_*_version fields must be populated.
+static void test_command_ack_polling() {
+    std::printf("test_command_ack_polling ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, /*waitForRadar=*/false);
+
+    // enter_configuration_mode_ -> ACK 0xFF with 8-byte payload (status + version + buffer)
+    // Stage three responses: each is released when the radar postamble is
+    // written (i.e. immediately after the corresponding command bytes go out).
+    s.inject_response(make_short_ack(0xFF, 8));
+    s.inject_response(make_firmware_ack(1, 7, 0x16, 0x15, 0x09, 0x22));
+    s.inject_response(make_short_ack(0xFE, 4));
+
+    bool ok = r.requestFirmwareVersion();
+    CHECK(ok);
+    CHECK_EQ((int)r.firmware_major_version, 1);
+    CHECK_EQ((int)r.firmware_minor_version, 7);
+    CHECK_EQ((unsigned long)r.firmware_bugfix_version, 0x22091516UL);
+    CHECK(!r.isAutoReadTaskRunning());
+    std::printf("ok\n");
+}
+
+// Test: ACK with wrong opcode -> command must time out, returns false.
+// Inject only enter-config ACK; the firmware command then receives no
+// matching ACK and wait_for_ack_ should give up at radar_uart_command_timeout_.
+static void test_command_ack_stale() {
+    std::printf("test_command_ack_stale ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, /*waitForRadar=*/false);
+    // Only enter-config ACK; nothing for the actual command. wait_for_ack_
+    // for 0xA0 will time out (radar_uart_command_timeout_ = 100 ms).
+    s.inject_response(make_short_ack(0xFF, 8));
+
+    // requestFirmwareVersion will: enter (ok), send 0xA0, then wait for 0xA0
+    // ACK that never arrives. Should return false.
+    bool ok = r.requestFirmwareVersion();
+    CHECK(!ok);
+    std::printf("ok\n");
+}
+
+// Test: two requestFirmwareVersion calls back-to-back. The cmd_seq_ counter
+// must invalidate any leftover ACK state from call #1 so call #2 doesn't
+// short-circuit on the previous response. We also vary the firmware bytes
+// between the two calls to confirm the second value is what we read.
+static void test_command_seq() {
+    std::printf("test_command_seq ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, /*waitForRadar=*/false);
+
+    // Call #1: major=1, minor=7
+    s.inject_response(make_short_ack(0xFF, 8));
+    s.inject_response(make_firmware_ack(1, 7, 0x16, 0x15, 0x09, 0x22));
+    s.inject_response(make_short_ack(0xFE, 4));
+    CHECK(r.requestFirmwareVersion());
+    CHECK_EQ((int)r.firmware_major_version, 1);
+
+    // Call #2: major=2, minor=10. Different bytes prove we are reading
+    // the SECOND ACK not a residual from the first.
+    s.inject_response(make_short_ack(0xFF, 8));
+    s.inject_response(make_firmware_ack(2, 10, 0x01, 0x02, 0x03, 0x04));
+    s.inject_response(make_short_ack(0xFE, 4));
+    CHECK(r.requestFirmwareVersion());
+    CHECK_EQ((int)r.firmware_major_version, 2);
+    CHECK_EQ((int)r.firmware_minor_version, 10);
+    CHECK_EQ((unsigned long)r.firmware_bugfix_version, 0x04030201UL);
+    std::printf("ok\n");
+}
+
+// Test: completely silent UART -> command must time out cleanly (no
+// infinite loop, no field corruption).
+static void test_command_no_ack() {
+    std::printf("test_command_no_ack ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, /*waitForRadar=*/false);
+    // s is empty: no ACK at all.
+    bool ok = r.requestFirmwareVersion();
+    CHECK(!ok);
+    // Fields must remain at their initial zero values.
+    CHECK_EQ((int)r.firmware_major_version, 0);
+    CHECK_EQ((int)r.firmware_minor_version, 0);
+    std::printf("ok\n");
+}
+
 int main() {
     test_basic_frame();
     test_engineering_frame();
     test_invalid_data_type();
     test_invalid_trailer();
     test_sequential_frames();
+    test_command_ack_polling();
+    test_command_ack_stale();
+    test_command_seq();
+    test_command_no_ack();
 
     if (failures == 0) {
         std::printf("\nALL TESTS PASS\n");

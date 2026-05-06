@@ -45,6 +45,7 @@
 
 ld2410 radar;
 uint32_t lastReading = 0;
+uint32_t lastConfigPoll = 0;
 
 void setup() {
   MONITOR_SERIAL.begin(115200);
@@ -106,6 +107,25 @@ void loop() {
       MONITOR_SERIAL.println();
     } else {
       MONITOR_SERIAL.println(F("No target"));
+    }
+  }
+
+  // Demonstration: every 30 s, while autoReadTask is busy reading frames,
+  // issue a configuration request. The library serialises the command on
+  // top of the running task — the task keeps draining UART, the command
+  // path waits on cmd_ack_seq_ for the matching ACK, and no race occurs.
+  if (radar.isAutoReadTaskRunning() && millis() - lastConfigPoll > 30000) {
+    lastConfigPoll = millis();
+    if (radar.requestCurrentConfiguration()) {
+      MONITOR_SERIAL.print(F("[config] max gates: "));
+      MONITOR_SERIAL.print(radar.max_moving_gate);
+      MONITOR_SERIAL.print(F(" moving / "));
+      MONITOR_SERIAL.print(radar.max_stationary_gate);
+      MONITOR_SERIAL.print(F(" stationary; idle "));
+      MONITOR_SERIAL.print(radar.sensor_idle_time);
+      MONITOR_SERIAL.println('s');
+    } else {
+      MONITOR_SERIAL.println(F("[config] requestCurrentConfiguration failed"));
     }
   }
 

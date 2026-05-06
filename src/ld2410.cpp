@@ -217,6 +217,17 @@ void ld2410::stopAutoReadTask() {
 }
 #endif
 
+// Reports whether autoReadTask() is currently running. Always false on
+// platforms without the FreeRTOS task path, so consumer code can branch on
+// runtime mode without compile-time #ifs.
+bool ld2410::isAutoReadTaskRunning() {
+#if defined(ESP32)
+    return taskHandle_ != nullptr;
+#else
+    return false;
+#endif
+}
+
 
 bool ld2410::presenceDetected()
 {
@@ -450,6 +461,98 @@ bool ld2410::parse_data_frame_() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Command synchronization helpers.
+//
+// begin_command_() is called by every request*/set* function right before
+// writing the command bytes to the UART. It bumps cmd_seq_ and resets the
+// expected-ACK opcode under data_mux_, and -- when no autoReadTask is
+// running -- discards any stale frame state (circular buffer, in-progress
+// parser state, UART RX FIFO bytes) from a previous command that may have
+// timed out. When the task is running it must NOT touch UART or buffer
+// state because the task owns them; the seq bump alone is enough to
+// invalidate stale ACKs.
+//
+// wait_for_ack_() drives the wait loop. Two modes:
+//   - no task running: drains UART hardware into the circular buffer and
+//     calls read_frame_() ourselves until either a matching ACK is parsed
+//     or the timeout expires.
+//   - task running:    leaves UART alone; polls cmd_ack_seq_ while letting
+//     the task fill the buffer and parse frames in its own context.
+// In both modes the matching condition is identical:
+//   cmd_ack_seq_ == cmd_seq_ AND latest_ack_ == expected_op
+// returning latest_command_success_ on match, false on timeout.
+// ---------------------------------------------------------------------------
+void ld2410::begin_command_(uint8_t expected_op)
+{
+	bool task_running = false;
+#if defined(ESP32)
+	task_running = (taskHandle_ != nullptr);
+	portENTER_CRITICAL(&data_mux_);
+#endif
+	expected_ack_opcode_ = expected_op;
+	cmd_seq_++;
+	if (!task_running) {
+		// Discard any half-parsed frame and drop the circular buffer contents
+		// so a stale ACK left over from a previous timeout cannot be matched
+		// by the new command.
+		buffer_tail = buffer_head;
+		frame_started_ = false;
+		radar_data_frame_position_ = 0;
+	}
+#if defined(ESP32)
+	portEXIT_CRITICAL(&data_mux_);
+#endif
+	if (!task_running) {
+		// Drain in-flight UART bytes from the previous command's timeout.
+		while (radar_uart_->available()) {
+			radar_uart_->read();
+		}
+	}
+}
+
+bool ld2410::wait_for_ack_(uint8_t expected_op, uint32_t timeout_ms)
+{
+	uint32_t start = millis();
+	bool task_running = false;
+#if defined(ESP32)
+	task_running = (taskHandle_ != nullptr);
+#endif
+	while (millis() - start < timeout_ms) {
+		if (!task_running) {
+			// Drive UART -> circular buffer -> parser ourselves
+			while (radar_uart_->available()) {
+				add_to_buffer(radar_uart_->read());
+			}
+			read_frame_();
+		}
+
+		bool got_ack = false;
+		bool ok = false;
+#if defined(ESP32)
+		portENTER_CRITICAL(&data_mux_);
+#endif
+		if (cmd_ack_seq_ == cmd_seq_ && latest_ack_ == expected_op) {
+			got_ack = true;
+			ok = latest_command_success_;
+		}
+#if defined(ESP32)
+		portEXIT_CRITICAL(&data_mux_);
+#endif
+		if (got_ack) {
+			return ok;
+		}
+
+#if defined(ESP32)
+		if (task_running) {
+			vTaskDelay(pdMS_TO_TICKS(1));
+		}
+#endif
+		yield();
+	}
+	return false;
+}
+
 bool ld2410::parse_command_frame_()
 {
 	uint16_t intra_frame_data_length_ = radar_data_frame_[4] + (radar_data_frame_[5] << 8);
@@ -462,8 +565,23 @@ bool ld2410::parse_command_frame_()
 		debug_uart_->print(F(" bytes"));
 	}
 	#endif
-	latest_ack_ = radar_data_frame_[6];
-	latest_command_success_ = (radar_data_frame_[8] == 0x00 && radar_data_frame_[9] == 0x00);
+	// Atomic update of (latest_ack_, latest_command_success_, cmd_ack_seq_).
+	// wait_for_ack_() reads this triplet to decide if the current command's
+	// ACK has landed. cmd_ack_seq_ mirrors cmd_seq_ only on opcode match,
+	// preventing false positives from stale ACKs of previously-timed-out commands.
+	uint8_t this_ack = radar_data_frame_[6];
+	bool this_success = (radar_data_frame_[8] == 0x00 && radar_data_frame_[9] == 0x00);
+#if defined(ESP32)
+	portENTER_CRITICAL(&data_mux_);
+#endif
+	latest_ack_ = this_ack;
+	latest_command_success_ = this_success;
+	if (this_ack == expected_ack_opcode_) {
+		cmd_ack_seq_ = cmd_seq_;
+	}
+#if defined(ESP32)
+	portEXIT_CRITICAL(&data_mux_);
+#endif
 	if(intra_frame_data_length_ == 8 && latest_ack_ == 0xFF)
 	{
 		#ifdef LD2410_DEBUG_COMMANDS
@@ -786,8 +904,8 @@ void ld2410::send_command_postamble_()
 
 bool ld2410::enter_configuration_mode_()
 {
+	begin_command_(0xFF);
 	send_command_preamble_();
-	//Request firmware
 	radar_uart_->write((byte) 0x04);	//Command is four bytes long
 	radar_uart_->write((byte) 0x00);
 	radar_uart_->write((byte) 0xFF);	//Request enter command mode
@@ -795,87 +913,43 @@ bool ld2410::enter_configuration_mode_()
 	radar_uart_->write((byte) 0x01);
 	radar_uart_->write((byte) 0x00);
 	send_command_postamble_();
-	radar_uart_last_command_ = millis();
-	while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-	{
-		if(read_frame_no_buffer_())
-		{
-			if(latest_ack_ == 0xFF && latest_command_success_)
-			{
-				return true;
-			}
-		}
-	}
-	return false;
+	return wait_for_ack_(0xFF, radar_uart_command_timeout_);
 }
 
 bool ld2410::leave_configuration_mode_()
 {
+	begin_command_(0xFE);
 	send_command_preamble_();
-	//Request firmware
 	radar_uart_->write((byte) 0x02);	//Command is two bytes long
 	radar_uart_->write((byte) 0x00);
 	radar_uart_->write((byte) 0xFE);	//Request leave command mode
 	radar_uart_->write((byte) 0x00);
 	send_command_postamble_();
-	radar_uart_last_command_ = millis();
-	while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-	{
-		if(read_frame_no_buffer_())
-		{
-			if(latest_ack_ == 0xFE && latest_command_success_)
-			{
-				return true;
-			}
-		}
-	}
-	return false;
+	return wait_for_ack_(0xFE, radar_uart_command_timeout_);
 }
 
 bool ld2410::requestStartEngineeringMode()
 {
+	begin_command_(0x62);
 	send_command_preamble_();
-	//Request firmware
 	radar_uart_->write((byte) 0x02);	//Command is two bytes long
 	radar_uart_->write((byte) 0x00);
-	radar_uart_->write((byte) 0x62);	//Request enter command mode
+	radar_uart_->write((byte) 0x62);	//Request enter engineering mode
 	radar_uart_->write((byte) 0x00);
 	send_command_postamble_();
-	radar_uart_last_command_ = millis();
-	while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-	{
-		if(read_frame_no_buffer_())
-		{
-			if(latest_ack_ == 0x62 && latest_command_success_)
-			{
-				return true;
-			}
-		}
-	}
-	return false;
+	return wait_for_ack_(0x62, radar_uart_command_timeout_);
 }
 
 bool ld2410::requestEndEngineeringMode()
 {
+	begin_command_(0x63);
 	send_command_preamble_();
-	//Request firmware
 	radar_uart_->write((byte) 0x02);	//Command is two bytes long
 	radar_uart_->write((byte) 0x00);
-	radar_uart_->write((byte) 0x63);	//Request leave command mode
+	radar_uart_->write((byte) 0x63);	//Request leave engineering mode
 	radar_uart_->write((byte) 0x00);
 	send_command_postamble_();
-	radar_uart_last_command_ = millis();
-	while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-	{
-		if(read_frame_no_buffer_())
-		{
-			if(latest_ack_ == 0x63 && latest_command_success_)
-			{
-				return true;
-			}
-		}
-	}
-	return false;
+	return wait_for_ack_(0x63, radar_uart_command_timeout_);
 }
 
 bool ld2410::requestCurrentConfiguration()
@@ -883,26 +957,17 @@ bool ld2410::requestCurrentConfiguration()
 	if(enter_configuration_mode_())
 	{
 		delay(50);
+		begin_command_(0x61);
 		send_command_preamble_();
-		//Request firmware
 		radar_uart_->write((byte) 0x02);	//Command is two bytes long
 		radar_uart_->write((byte) 0x00);
 		radar_uart_->write((byte) 0x61);	//Request current configuration
 		radar_uart_->write((byte) 0x00);
 		send_command_postamble_();
-		radar_uart_last_command_ = millis();
-		while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-		{
-			if(read_frame_no_buffer_())
-			{
-				if(latest_ack_ == 0x61 && latest_command_success_)
-				{
-					delay(50);
-					leave_configuration_mode_();
-					return true;
-				}
-			}
-		}
+		bool ok = wait_for_ack_(0x61, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
 	}
 	delay(50);
 	leave_configuration_mode_();
@@ -914,100 +979,21 @@ bool ld2410::requestFirmwareVersion()
 	if(enter_configuration_mode_())
 	{
 		delay(50);
+		begin_command_(0xA0);
 		send_command_preamble_();
-		//Request firmware
 		radar_uart_->write((byte) 0x02);	//Command is two bytes long
 		radar_uart_->write((byte) 0x00);
 		radar_uart_->write((byte) 0xA0);	//Request firmware version
 		radar_uart_->write((byte) 0x00);
 		send_command_postamble_();
-		radar_uart_last_command_ = millis();
-		while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-		{
-			read_frame_no_buffer_();
-			if(latest_ack_ == 0xA0 && latest_command_success_)
-			{
-				delay(50);
-				leave_configuration_mode_();
-				return true;
-			}
-		}
+		bool ok = wait_for_ack_(0xA0, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
 	}
 	delay(50);
 	leave_configuration_mode_();
 	return false;
-}
-
-
-bool ld2410::read_frame_no_buffer_() {
-    if(radar_uart_->available()) {
-        if(frame_started_ == false) {
-            uint8_t byte_read_ = radar_uart_->read();
-            if(byte_read_ == 0xF4) {
-                radar_data_frame_[radar_data_frame_position_++] = byte_read_;
-                frame_started_ = true;
-                ack_frame_ = false;
-            }
-            else if(byte_read_ == 0xFD) {
-                radar_data_frame_[radar_data_frame_position_++] = byte_read_;
-                frame_started_ = true;
-                ack_frame_ = true;
-            }
-        }
-        else {
-            if(radar_data_frame_position_ < LD2410_MAX_FRAME_LENGTH) {
-                radar_data_frame_[radar_data_frame_position_++] = radar_uart_->read();
-                
-                if(radar_data_frame_position_ > 7) {
-                    // Check data frame end
-                    if( radar_data_frame_[0] == 0xF4 &&
-                        radar_data_frame_[1] == 0xF3 &&
-                        radar_data_frame_[2] == 0xF2 &&
-                        radar_data_frame_[3] == 0xF1 &&
-                        radar_data_frame_[radar_data_frame_position_ - 4] == 0xF8 &&
-                        radar_data_frame_[radar_data_frame_position_ - 3] == 0xF7 &&
-                        radar_data_frame_[radar_data_frame_position_ - 2] == 0xF6 &&
-                        radar_data_frame_[radar_data_frame_position_ - 1] == 0xF5)
-                    {
-                        if(parse_data_frame_()) {
-                            frame_started_ = false;
-                            radar_data_frame_position_ = 0;
-                            return true;
-                        }
-                        else {
-                            frame_started_ = false;
-                            radar_data_frame_position_ = 0;
-                        }
-                    }
-                    // Check command frame end
-                    else if(radar_data_frame_[0] == 0xFD &&
-                            radar_data_frame_[1] == 0xFC &&
-                            radar_data_frame_[2] == 0xFB &&
-                            radar_data_frame_[3] == 0xFA &&
-                            radar_data_frame_[radar_data_frame_position_ - 4] == 0x04 &&
-                            radar_data_frame_[radar_data_frame_position_ - 3] == 0x03 &&
-                            radar_data_frame_[radar_data_frame_position_ - 2] == 0x02 &&
-                            radar_data_frame_[radar_data_frame_position_ - 1] == 0x01)
-                    {
-                        if(parse_command_frame_()) {
-                            frame_started_ = false;
-                            radar_data_frame_position_ = 0;
-                            return true;
-                        }
-                        else {
-                            frame_started_ = false;
-                            radar_data_frame_position_ = 0;
-                        }
-                    }
-                }
-            }
-            else {
-                frame_started_ = false;
-                radar_data_frame_position_ = 0;
-            }
-        }
-    }
-    return false;
 }
 
 
@@ -1017,26 +1003,52 @@ bool ld2410::requestRestart()
 	if(enter_configuration_mode_())
 	{
 		delay(50);
+		begin_command_(0xA3);
 		send_command_preamble_();
-		//Request firmware
 		radar_uart_->write((byte) 0x02);	//Command is two bytes long
 		radar_uart_->write((byte) 0x00);
 		radar_uart_->write((byte) 0xA3);	//Request restart
 		radar_uart_->write((byte) 0x00);
 		send_command_postamble_();
-		radar_uart_last_command_ = millis();
-		while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-		{
-			if(read_frame_())
-			{
-				if(latest_ack_ == 0xA3 && latest_command_success_)
-				{
-					delay(50);
-					leave_configuration_mode_();
-					return true;
-				}
+		bool ok = wait_for_ack_(0xA3, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		if (ok) {
+			// After ACK 0xA3 the radar reboots and emits ~500-800ms of garbage
+			// or silence on its UART. If autoReadTask is running it would
+			// happily feed those bytes to parse_data_frame_, occasionally
+			// matching a 0xF4/0xFD frame start and clobbering the field cache
+			// with synthetic data. Suspend the task across the reboot window,
+			// drain the UART RX FIFO and the circular buffer twice, then
+			// resume.
+#if defined(ESP32)
+			TaskHandle_t suspended = nullptr;
+			portENTER_CRITICAL(&data_mux_);
+			suspended = taskHandle_;
+			portEXIT_CRITICAL(&data_mux_);
+			if (suspended != nullptr) {
+				vTaskSuspend(suspended);
 			}
+#endif
+			while (radar_uart_->available()) radar_uart_->read();
+			delay(800);
+			while (radar_uart_->available()) radar_uart_->read();
+#if defined(ESP32)
+			portENTER_CRITICAL(&data_mux_);
+			buffer_tail = buffer_head;
+			frame_started_ = false;
+			radar_data_frame_position_ = 0;
+			portEXIT_CRITICAL(&data_mux_);
+			if (suspended != nullptr) {
+				vTaskResume(suspended);
+			}
+#else
+			buffer_tail = buffer_head;
+			frame_started_ = false;
+			radar_data_frame_position_ = 0;
+#endif
 		}
+		return ok;
 	}
 	delay(50);
 	leave_configuration_mode_();
@@ -1048,26 +1060,17 @@ bool ld2410::requestFactoryReset()
 	if(enter_configuration_mode_())
 	{
 		delay(50);
+		begin_command_(0xA2);
 		send_command_preamble_();
-		//Request firmware
 		radar_uart_->write((byte) 0x02);	//Command is two bytes long
 		radar_uart_->write((byte) 0x00);
 		radar_uart_->write((byte) 0xA2);	//Request factory reset
 		radar_uart_->write((byte) 0x00);
 		send_command_postamble_();
-		radar_uart_last_command_ = millis();
-		while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-		{
-			if(read_frame_())
-			{
-				if(latest_ack_ == 0xA2 && latest_command_success_)
-				{
-					delay(50);
-					leave_configuration_mode_();
-					return true;
-				}
-			}
-		}
+		bool ok = wait_for_ack_(0xA2, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
 	}
 	delay(50);
 	leave_configuration_mode_();
@@ -1079,6 +1082,7 @@ bool ld2410::setMaxValues(uint16_t moving, uint16_t stationary, uint16_t inactiv
 	if(enter_configuration_mode_())
 	{
 		delay(50);
+		begin_command_(0x60);
 		send_command_preamble_();
 		radar_uart_->write((byte) 0x14);	//Command is 20 bytes long
 		radar_uart_->write((byte) 0x00);
@@ -1103,19 +1107,10 @@ bool ld2410::setMaxValues(uint16_t moving, uint16_t stationary, uint16_t inactiv
 		radar_uart_->write((byte) 0x00);	//Spacer
 		radar_uart_->write((byte) 0x00);
 		send_command_postamble_();
-		radar_uart_last_command_ = millis();
-		while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-		{
-			if(read_frame_())
-			{
-				if(latest_ack_ == 0x60 && latest_command_success_)
-				{
-					delay(50);
-					leave_configuration_mode_();
-					return true;
-				}
-			}
-		}
+		bool ok = wait_for_ack_(0x60, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
 	}
 	delay(50);
 	leave_configuration_mode_();
@@ -1127,6 +1122,7 @@ bool ld2410::setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t s
 	if(enter_configuration_mode_())
 	{
 		delay(50);
+		begin_command_(0x64);
 		send_command_preamble_();
 		radar_uart_->write((byte) 0x14);	//Command is 20 bytes long
 		radar_uart_->write((byte) 0x00);
@@ -1151,19 +1147,10 @@ bool ld2410::setGateSensitivityThreshold(uint8_t gate, uint8_t moving, uint8_t s
 		radar_uart_->write((byte) 0x00);	//Spacer
 		radar_uart_->write((byte) 0x00);
 		send_command_postamble_();
-		radar_uart_last_command_ = millis();
-		while(millis() - radar_uart_last_command_ < radar_uart_command_timeout_)
-		{
-			if(read_frame_())
-			{
-				if(latest_ack_ == 0x64 && latest_command_success_)
-				{
-					delay(50);
-					leave_configuration_mode_();
-					return true;
-				}
-			}
-		}
+		bool ok = wait_for_ack_(0x64, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
 	}
 	delay(50);
 	leave_configuration_mode_();
