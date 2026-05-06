@@ -430,6 +430,122 @@ static void test_command_no_ack() {
     std::printf("ok\n");
 }
 
+// ---------------------------------------------------------------------------
+// Test 10: a lone 0xF4 followed by non-magic bytes must NOT commit to a
+// frame. Pre-fix, the parser captured any 0xF4 as a frame start; if the
+// next bytes happened to look like a length+payload, fields could be
+// mis-populated. Post-fix, all four header bytes are validated.
+// ---------------------------------------------------------------------------
+static void test_lone_F4_not_a_header() {
+    std::printf("test_lone_F4_not_a_header ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, false);
+    s.inject({
+        // Lone 0xF4 + three non-magic bytes, then a real frame.
+        0xF4, 0x12, 0x34, 0x56,
+        0xF4, 0xF3, 0xF2, 0xF1,
+        0x0D, 0x00,
+        0x02, 0xAA,
+        0x02, 0x51, 0x00, 0x00, 0x00, 0x00, 0x3B, 0x00, 0x00,
+        0x55, 0x00,
+        0xF8, 0xF7, 0xF6, 0xF5
+    });
+    drain(r, s);
+    CHECK_EQ((int)r.movingTargetDistance(), 81);
+    CHECK_EQ((int)r.stationaryTargetEnergy(), 59);
+    std::printf("ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: when a partial header is broken by 0xF4 itself (e.g. radar emits
+// F4 F3 F2 then a stray F4), the parser must reuse the F4 as a fresh
+// position-0, not drop it. This exercises the resync branch where the
+// offending byte is itself a candidate header.
+// ---------------------------------------------------------------------------
+static void test_resync_F4_at_wrong_position() {
+    std::printf("test_resync_F4_at_wrong_position ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, false);
+    s.inject({
+        0xF4, 0xF3, 0xF2,                 // partial header, missing F1
+        0xF4, 0xF3, 0xF2, 0xF1,           // real header (the F4 here is the resync)
+        0x0D, 0x00,
+        0x02, 0xAA,
+        0x02, 0x51, 0x00, 0x00, 0x00, 0x00, 0x3B, 0x00, 0x00,
+        0x55, 0x00,
+        0xF8, 0xF7, 0xF6, 0xF5
+    });
+    drain(r, s);
+    CHECK_EQ((int)r.movingTargetDistance(), 81);
+    std::printf("ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: the payload contains the data-frame footer pattern F8 F7 F6 F5
+// in the middle. Pre-fix, the parser called check_frame_end_() after every
+// byte from position 8 onwards and would terminate early when these four
+// bytes appeared in payload, then reject the frame for length mismatch and
+// lose alignment. Post-fix, the footer is only checked at the position
+// dictated by the length field.
+// ---------------------------------------------------------------------------
+static void test_no_early_termination_on_payload_footer() {
+    std::printf("test_no_early_termination_on_payload_footer ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, false);
+    s.inject({
+        0xF4, 0xF3, 0xF2, 0xF1,
+        0x0D, 0x00,
+        0x02, 0xAA,
+        0x02,                             // target status
+        0xF8, 0xF7,                       // moving distance LE = 0xF7F8 (intra bytes 3..4)
+        0xF6,                             // moving energy = F6 (intra byte 5; getter clamps to 100)
+        0xF5, 0x00,                       // stationary distance LE = 0x00F5
+        0x00,                             // stationary energy
+        0x42, 0x00,                       // detection distance = 0x0042 = 66 (sentinel)
+        0x55, 0x00,
+        0xF8, 0xF7, 0xF6, 0xF5
+    });
+    // With the old parser, intra-bytes [F8 F7 F6 F5] at positions 9..12 of the
+    // accumulated frame would trigger the per-byte footer check at position 13
+    // and terminate the frame early; parse_data_frame_ would reject and the
+    // detection_distance field (the last field, written only at full parse)
+    // would stay at 0. The sentinel 66 above proves the new parser walked all
+    // 23 bytes before validating the footer.
+    drain(r, s);
+    CHECK_EQ((int)r.movingTargetDistance(), 0xF7F8);
+    CHECK_EQ((int)r.stationaryTargetDistance(), 0x00F5);
+    CHECK_EQ((int)r.detectionDistance(), 66);
+    std::printf("ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: a bogus length field rejects the frame and the parser resyncs in
+// time to capture the next valid frame.
+// ---------------------------------------------------------------------------
+static void test_resync_after_bogus_length() {
+    std::printf("test_resync_after_bogus_length ... ");
+    ld2410 r;
+    MockSerial s;
+    r.begin(s, false);
+    s.inject({
+        0xF4, 0xF3, 0xF2, 0xF1,
+        0xFF, 0xFF,                       // intra length 65535 > LD2410_MAX_FRAME_LENGTH
+        // Parser must drop and look for a fresh header in the bytes that follow.
+        0xF4, 0xF3, 0xF2, 0xF1,
+        0x0D, 0x00,
+        0x02, 0xAA,
+        0x02, 0x51, 0x00, 0x00, 0x00, 0x00, 0x3B, 0x00, 0x00,
+        0x55, 0x00,
+        0xF8, 0xF7, 0xF6, 0xF5
+    });
+    drain(r, s);
+    CHECK_EQ((int)r.movingTargetDistance(), 81);
+    std::printf("ok\n");
+}
+
 int main() {
     test_basic_frame();
     test_engineering_frame();
@@ -440,6 +556,10 @@ int main() {
     test_command_ack_stale();
     test_command_seq();
     test_command_no_ack();
+    test_lone_F4_not_a_header();
+    test_resync_F4_at_wrong_position();
+    test_no_early_termination_on_payload_footer();
+    test_resync_after_bogus_length();
 
     if (failures == 0) {
         std::printf("\nALL TESTS PASS\n");

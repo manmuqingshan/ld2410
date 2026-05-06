@@ -14,21 +14,11 @@
 #define ld2410_cpp
 #include "ld2410.h"
 
-
-uint8_t circular_buffer[LD2410_BUFFER_SIZE];
-uint16_t buffer_head = 0;
-uint16_t buffer_tail = 0;
-
-// Enumerazione per lo stato del parsing
-enum ParseState { WAITING_START, READING_LENGTH, READING_DATA, CHECKING_END };
-ParseState current_state = WAITING_START;
-
-// Buffer pre-allocato per il frame
-#define MAX_FRAME_SIZE 1024
-uint8_t frame_buffer[MAX_FRAME_SIZE];
-uint16_t frame_position = 0;
-uint16_t frame_length = 0;
-
+// Magic header bytes for the two frame kinds. The protocol document
+// (HLK-LD2410C V1.00 §2.3) defines them as fixed 4-byte preambles; the
+// parser validates all four bytes before committing to a frame.
+static const uint8_t LD2410_DATA_HDR[4] = {0xF4, 0xF3, 0xF2, 0xF1};
+static const uint8_t LD2410_CMD_HDR[4]  = {0xFD, 0xFC, 0xFB, 0xFA};
 
 ld2410::ld2410()	//Constructor function
 {
@@ -58,25 +48,6 @@ bool ld2410::read_from_buffer(uint8_t &byte) {
         buffer_tail = (buffer_tail + 1) % LD2410_BUFFER_SIZE;
         return true;
     }
-}
-
-bool ld2410::find_frame_start() {
-    uint8_t byte;
-
-    // Continua a leggere dal buffer finché non trovi l'inizio del frame
-    while (read_from_buffer(byte)) {
-        // Controlla se il byte è l'inizio di un frame
-        if (byte == 0xF4 || byte == 0xFD) {
-            // Inizia un nuovo frame
-            radar_data_frame_[0] = byte;
-            radar_data_frame_position_ = 1;  // Reset della posizione del frame
-            frame_started_ = true;
-            ack_frame_ = (byte == 0xFD);  // Determina il tipo di frame (ack o data)
-            return true;
-        }
-    }
-
-    return false;  // Nessun frame trovato
 }
 
 bool ld2410::begin(Stream &radarStream, bool waitForRadar) {
@@ -355,47 +326,94 @@ void ld2410::print_frame_()
 	}
 }
 
+// Length-driven frame parser.
+//
+// Layout (HLK-LD2410C protocol V1.00 §2.3):
+//   [0..3]  4-byte magic header  (F4 F3 F2 F1 for data, FD FC FB FA for cmd)
+//   [4..5]  intra-frame data length, little-endian (uint16)
+//   [6..N]  intra-frame data, exactly `intra_len` bytes
+//   [N+1..N+4] 4-byte footer    (F8 F7 F6 F5 for data, 04 03 02 01 for cmd)
+// Total frame length = intra_len + 10.
+//
+// The previous parser (a) committed to a frame after a single 0xF4/0xFD byte
+// and (b) tested the footer pattern after every byte from position 8 onwards.
+// Both broke alignment under any kind of byte loss or when intra-frame data
+// happened to contain bytes resembling the footer (e.g. a stationary distance
+// of 244 cm has 0xF4 as its low byte). This version validates all four header
+// bytes before committing, captures the length once, accumulates exactly that
+// many bytes, then validates the footer and parses. On any mid-frame
+// inconsistency it resyncs, and if the offending byte is itself a candidate
+// header start it is reused as the new position 0 so we don't lose a header.
 bool ld2410::read_frame_() {
     uint8_t byte_read;
-    while (read_from_buffer(byte_read)) {  // Corrected to pass byte_read by reference
-        // If the frame has not started, check for the frame start
-        if (!frame_started_) {
-            if (byte_read == 0xF4 || byte_read == 0xFD) {
+    while (read_from_buffer(byte_read)) {
+        const uint8_t pos = radar_data_frame_position_;
+
+        // Stage A: locate the magic header (positions 0..3).
+        if (pos == 0) {
+            if (byte_read == 0xF4) {
                 radar_data_frame_[0] = byte_read;
                 radar_data_frame_position_ = 1;
-                frame_started_ = true;
-                ack_frame_ = (byte_read == 0xFD);  // Determine the type of frame
+                ack_frame_ = false;
+            } else if (byte_read == 0xFD) {
+                radar_data_frame_[0] = byte_read;
+                radar_data_frame_position_ = 1;
+                ack_frame_ = true;
             }
-        } else {
-            // Continue accumulating the frame bytes
-            radar_data_frame_[radar_data_frame_position_++] = byte_read;
-
-            // After reading at least 8 bytes, verify the frame length
-            if (radar_data_frame_position_ == 8) {
-                uint16_t intra_frame_data_length = radar_data_frame_[4] | (radar_data_frame_[5] << 8);
-
-                // Check if the frame length exceeds the maximum allowed
-                if (intra_frame_data_length + 10 > LD2410_MAX_FRAME_LENGTH) {
-                    frame_started_ = false;
-                    radar_data_frame_position_ = 0;
-                    continue;  // Skip this frame
-                }
-            }
-
-            // Check if the frame is complete
-            if (radar_data_frame_position_ >= 8 && check_frame_end_()) {
-                frame_started_ = false;  // Reset state for the next frame
-
-                // Process the frame (command or data)
-                if (ack_frame_) {
-                    return parse_command_frame_();
-                } else {
-                    return parse_data_frame_();
-                }
-            }
+            // else: drop byte, keep scanning
+            continue;
         }
+
+        if (pos < 4) {
+            const uint8_t expected = (ack_frame_ ? LD2410_CMD_HDR : LD2410_DATA_HDR)[pos];
+            if (byte_read == expected) {
+                radar_data_frame_[pos] = byte_read;
+                radar_data_frame_position_ = pos + 1;
+            } else if (byte_read == 0xF4) {
+                radar_data_frame_[0] = byte_read;
+                radar_data_frame_position_ = 1;
+                ack_frame_ = false;
+            } else if (byte_read == 0xFD) {
+                radar_data_frame_[0] = byte_read;
+                radar_data_frame_position_ = 1;
+                ack_frame_ = true;
+            } else {
+                radar_data_frame_position_ = 0;
+            }
+            continue;
+        }
+
+        // Stage B: capture the length field, then the body.
+        radar_data_frame_[pos] = byte_read;
+        radar_data_frame_position_ = pos + 1;
+
+        if (pos == 5) {
+            const uint16_t intra = (uint16_t)radar_data_frame_[4]
+                                 | ((uint16_t)radar_data_frame_[5] << 8);
+            if (intra == 0 || intra + 10 > LD2410_MAX_FRAME_LENGTH) {
+                radar_data_frame_position_ = 0;
+            }
+            continue;
+        }
+
+        if (pos < 6) continue;
+
+        const uint16_t intra = (uint16_t)radar_data_frame_[4]
+                             | ((uint16_t)radar_data_frame_[5] << 8);
+        const uint16_t total = intra + 10;
+        if (radar_data_frame_position_ < total) continue;
+
+        // Frame fully received. Validate footer once at the known position.
+        const bool footer_ok = check_frame_end_();
+        const bool was_ack   = ack_frame_;
+        bool ok = false;
+        if (footer_ok) {
+            ok = was_ack ? parse_command_frame_() : parse_data_frame_();
+        }
+        radar_data_frame_position_ = 0;
+        if (ok) return true;
     }
-    return false;  // No complete frame was found
+    return false;
 }
 
 bool ld2410::parse_data_frame_() {
@@ -497,7 +515,6 @@ void ld2410::begin_command_(uint8_t expected_op)
 		// so a stale ACK left over from a previous timeout cannot be matched
 		// by the new command.
 		buffer_tail = buffer_head;
-		frame_started_ = false;
 		radar_data_frame_position_ = 0;
 	}
 #if defined(ESP32)
@@ -1036,7 +1053,6 @@ bool ld2410::requestRestart()
 #if defined(ESP32)
 			portENTER_CRITICAL(&data_mux_);
 			buffer_tail = buffer_head;
-			frame_started_ = false;
 			radar_data_frame_position_ = 0;
 			portEXIT_CRITICAL(&data_mux_);
 			if (suspended != nullptr) {
@@ -1044,7 +1060,6 @@ bool ld2410::requestRestart()
 			}
 #else
 			buffer_tail = buffer_head;
-			frame_started_ = false;
 			radar_data_frame_position_ = 0;
 #endif
 		}
