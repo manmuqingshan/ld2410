@@ -80,7 +80,6 @@ class ld2410	{
 		Stream *debug_uart_ = nullptr;									//The stream used for the debugging
 		uint32_t radar_uart_timeout = 100;								//How long to give up on receiving some useful data from the LD2410
 		uint32_t radar_uart_last_packet_ = 0;							//Time of the last packet from the radar
-		uint32_t radar_uart_last_command_ = 0;							//Time of the last command sent to the radar
 		uint32_t radar_uart_command_timeout_ = 100;						//Timeout for sending commands
 		uint8_t latest_ack_ = 0;
 		bool latest_command_success_ = false;
@@ -118,7 +117,6 @@ class ld2410	{
         bool check_frame_end_();
 		
 		bool read_frame_();		
-		bool read_frame_no_buffer_();										//Try to read a frame from the UART
 		bool parse_data_frame_();										//Is the current data frame valid?
 		bool parse_command_frame_();									//Is the current command frame valid?
 		void begin_command_(uint8_t expected_op);						//Bump cmd_seq_, reset stale state, set expected ACK opcode
