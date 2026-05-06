@@ -11,14 +11,6 @@ The LD2410, as sold for configuration with the common breakout boards shown abov
 
 The modules also provide an 'active high' output on the 'OUT' pin which can be used to signal presence, based off the settings configured. Once the modules are configured it is not necessary to use their UART, but it provides much more information.
 
-## Updates in this fork (`adapt-to-it/ld2410`)
-
-This is a maintained fork of [`ncmreynolds/ld2410`](https://github.com/ncmreynolds/ld2410). The following pull requests have been merged into `main`:
-
-- [**#1 — Cross-platform task fixes + protocol-aligned engineering frame parser**](https://github.com/adapt-to-it/ld2410/pull/1) — removes ESP32-only constructs from the polling path so AVR/ESP8266 builds compile cleanly again, fixes engineering-frame byte offsets per the [HLK-LD2410C protocol spec](docs/HLK-LD2410C_protocol.md), protects shared sensor state with `portMUX_TYPE` on ESP32, and introduces the optional `autoReadTask()` background-reader API on ESP32.
-- [**#2 — Native host-side parser unit tests**](https://github.com/adapt-to-it/ld2410/pull/2) — `g++` build of the parser against fixture frames from the protocol doc, runnable with `bash tests/run.sh`.
-- [**#3 — Task-safe `request*`/`set*` commands**](https://github.com/adapt-to-it/ld2410/pull/3) — the command path now coordinates with `autoReadTask` via a sequence-number ACK helper (`wait_for_ack_`), so blocking commands can be issued concurrently with the background reader without UART races. Adds the `isAutoReadTaskRunning()` getter.
-
 ## Connections
 
 The module must be powered by 5V or higher, but does 3.3v I/O, please consider this when working with the module.
