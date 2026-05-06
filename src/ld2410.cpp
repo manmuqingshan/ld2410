@@ -450,6 +450,98 @@ bool ld2410::parse_data_frame_() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Command synchronization helpers.
+//
+// begin_command_() is called by every request*/set* function right before
+// writing the command bytes to the UART. It bumps cmd_seq_ and resets the
+// expected-ACK opcode under data_mux_, and -- when no autoReadTask is
+// running -- discards any stale frame state (circular buffer, in-progress
+// parser state, UART RX FIFO bytes) from a previous command that may have
+// timed out. When the task is running it must NOT touch UART or buffer
+// state because the task owns them; the seq bump alone is enough to
+// invalidate stale ACKs.
+//
+// wait_for_ack_() drives the wait loop. Two modes:
+//   - no task running: drains UART hardware into the circular buffer and
+//     calls read_frame_() ourselves until either a matching ACK is parsed
+//     or the timeout expires.
+//   - task running:    leaves UART alone; polls cmd_ack_seq_ while letting
+//     the task fill the buffer and parse frames in its own context.
+// In both modes the matching condition is identical:
+//   cmd_ack_seq_ == cmd_seq_ AND latest_ack_ == expected_op
+// returning latest_command_success_ on match, false on timeout.
+// ---------------------------------------------------------------------------
+void ld2410::begin_command_(uint8_t expected_op)
+{
+	bool task_running = false;
+#if defined(ESP32)
+	task_running = (taskHandle_ != nullptr);
+	portENTER_CRITICAL(&data_mux_);
+#endif
+	expected_ack_opcode_ = expected_op;
+	cmd_seq_++;
+	if (!task_running) {
+		// Discard any half-parsed frame and drop the circular buffer contents
+		// so a stale ACK left over from a previous timeout cannot be matched
+		// by the new command.
+		buffer_tail = buffer_head;
+		frame_started_ = false;
+		radar_data_frame_position_ = 0;
+	}
+#if defined(ESP32)
+	portEXIT_CRITICAL(&data_mux_);
+#endif
+	if (!task_running) {
+		// Drain in-flight UART bytes from the previous command's timeout.
+		while (radar_uart_->available()) {
+			radar_uart_->read();
+		}
+	}
+}
+
+bool ld2410::wait_for_ack_(uint8_t expected_op, uint32_t timeout_ms)
+{
+	uint32_t start = millis();
+	bool task_running = false;
+#if defined(ESP32)
+	task_running = (taskHandle_ != nullptr);
+#endif
+	while (millis() - start < timeout_ms) {
+		if (!task_running) {
+			// Drive UART -> circular buffer -> parser ourselves
+			while (radar_uart_->available()) {
+				add_to_buffer(radar_uart_->read());
+			}
+			read_frame_();
+		}
+
+		bool got_ack = false;
+		bool ok = false;
+#if defined(ESP32)
+		portENTER_CRITICAL(&data_mux_);
+#endif
+		if (cmd_ack_seq_ == cmd_seq_ && latest_ack_ == expected_op) {
+			got_ack = true;
+			ok = latest_command_success_;
+		}
+#if defined(ESP32)
+		portEXIT_CRITICAL(&data_mux_);
+#endif
+		if (got_ack) {
+			return ok;
+		}
+
+#if defined(ESP32)
+		if (task_running) {
+			vTaskDelay(pdMS_TO_TICKS(1));
+		}
+#endif
+		yield();
+	}
+	return false;
+}
+
 bool ld2410::parse_command_frame_()
 {
 	uint16_t intra_frame_data_length_ = radar_data_frame_[4] + (radar_data_frame_[5] << 8);
@@ -462,8 +554,23 @@ bool ld2410::parse_command_frame_()
 		debug_uart_->print(F(" bytes"));
 	}
 	#endif
-	latest_ack_ = radar_data_frame_[6];
-	latest_command_success_ = (radar_data_frame_[8] == 0x00 && radar_data_frame_[9] == 0x00);
+	// Atomic update of (latest_ack_, latest_command_success_, cmd_ack_seq_).
+	// wait_for_ack_() reads this triplet to decide if the current command's
+	// ACK has landed. cmd_ack_seq_ mirrors cmd_seq_ only on opcode match,
+	// preventing false positives from stale ACKs of previously-timed-out commands.
+	uint8_t this_ack = radar_data_frame_[6];
+	bool this_success = (radar_data_frame_[8] == 0x00 && radar_data_frame_[9] == 0x00);
+#if defined(ESP32)
+	portENTER_CRITICAL(&data_mux_);
+#endif
+	latest_ack_ = this_ack;
+	latest_command_success_ = this_success;
+	if (this_ack == expected_ack_opcode_) {
+		cmd_ack_seq_ = cmd_seq_;
+	}
+#if defined(ESP32)
+	portEXIT_CRITICAL(&data_mux_);
+#endif
 	if(intra_frame_data_length_ == 8 && latest_ack_ == 0xFF)
 	{
 		#ifdef LD2410_DEBUG_COMMANDS
