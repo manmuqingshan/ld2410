@@ -1002,6 +1002,41 @@ bool ld2410::requestRestart()
 		bool ok = wait_for_ack_(0xA3, radar_uart_command_timeout_);
 		delay(50);
 		leave_configuration_mode_();
+		if (ok) {
+			// After ACK 0xA3 the radar reboots and emits ~500-800ms of garbage
+			// or silence on its UART. If autoReadTask is running it would
+			// happily feed those bytes to parse_data_frame_, occasionally
+			// matching a 0xF4/0xFD frame start and clobbering the field cache
+			// with synthetic data. Suspend the task across the reboot window,
+			// drain the UART RX FIFO and the circular buffer twice, then
+			// resume.
+#if defined(ESP32)
+			TaskHandle_t suspended = nullptr;
+			portENTER_CRITICAL(&data_mux_);
+			suspended = taskHandle_;
+			portEXIT_CRITICAL(&data_mux_);
+			if (suspended != nullptr) {
+				vTaskSuspend(suspended);
+			}
+#endif
+			while (radar_uart_->available()) radar_uart_->read();
+			delay(800);
+			while (radar_uart_->available()) radar_uart_->read();
+#if defined(ESP32)
+			portENTER_CRITICAL(&data_mux_);
+			buffer_tail = buffer_head;
+			frame_started_ = false;
+			radar_data_frame_position_ = 0;
+			portEXIT_CRITICAL(&data_mux_);
+			if (suspended != nullptr) {
+				vTaskResume(suspended);
+			}
+#else
+			buffer_tail = buffer_head;
+			frame_started_ = false;
+			radar_data_frame_position_ = 0;
+#endif
+		}
 		return ok;
 	}
 	delay(50);
