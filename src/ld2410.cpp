@@ -947,26 +947,51 @@ bool ld2410::leave_configuration_mode_()
 
 bool ld2410::requestStartEngineeringMode()
 {
-	begin_command_(0x62);
-	send_command_preamble_();
-	radar_uart_->write((byte) 0x02);	//Command is two bytes long
-	radar_uart_->write((byte) 0x00);
-	radar_uart_->write((byte) 0x62);	//Request enter engineering mode
-	radar_uart_->write((byte) 0x00);
-	send_command_postamble_();
-	return wait_for_ack_(0x62, radar_uart_command_timeout_);
+	// Per protocol §2.4.1, every config command must be issued inside an
+	// enter/leave configuration window — otherwise the radar silently
+	// rejects it. The other request*/set* helpers all wrap; these two
+	// engineering-mode helpers were originally missing the wrap, which
+	// caused the command to time out without an ACK.
+	if(enter_configuration_mode_())
+	{
+		delay(50);
+		begin_command_(0x62);
+		send_command_preamble_();
+		radar_uart_->write((byte) 0x02);	//Command is two bytes long
+		radar_uart_->write((byte) 0x00);
+		radar_uart_->write((byte) 0x62);	//Request enter engineering mode
+		radar_uart_->write((byte) 0x00);
+		send_command_postamble_();
+		bool ok = wait_for_ack_(0x62, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
+	}
+	delay(50);
+	leave_configuration_mode_();
+	return false;
 }
 
 bool ld2410::requestEndEngineeringMode()
 {
-	begin_command_(0x63);
-	send_command_preamble_();
-	radar_uart_->write((byte) 0x02);	//Command is two bytes long
-	radar_uart_->write((byte) 0x00);
-	radar_uart_->write((byte) 0x63);	//Request leave engineering mode
-	radar_uart_->write((byte) 0x00);
-	send_command_postamble_();
-	return wait_for_ack_(0x63, radar_uart_command_timeout_);
+	if(enter_configuration_mode_())
+	{
+		delay(50);
+		begin_command_(0x63);
+		send_command_preamble_();
+		radar_uart_->write((byte) 0x02);	//Command is two bytes long
+		radar_uart_->write((byte) 0x00);
+		radar_uart_->write((byte) 0x63);	//Request leave engineering mode
+		radar_uart_->write((byte) 0x00);
+		send_command_postamble_();
+		bool ok = wait_for_ack_(0x63, radar_uart_command_timeout_);
+		delay(50);
+		leave_configuration_mode_();
+		return ok;
+	}
+	delay(50);
+	leave_configuration_mode_();
+	return false;
 }
 
 bool ld2410::requestCurrentConfiguration()
