@@ -85,8 +85,7 @@ class ld2410	{
 		uint8_t latest_ack_ = 0;
 		bool latest_command_success_ = false;
 		uint8_t radar_data_frame_[LD2410_MAX_FRAME_LENGTH];				//Store the incoming data from the radar, to check it's in a valid format
-		uint8_t radar_data_frame_position_ = 0;							//Where in the frame we are currently writing
-		bool frame_started_ = false;									//Whether a frame is currently being read
+		uint8_t radar_data_frame_position_ = 0;							//Where in the frame we are currently writing; 0 means no frame in progress
 		bool ack_frame_ = false;										//Whether the incoming frame is LIKELY an ACK frame
 		bool waiting_for_ack_ = false;									//Whether a command has just been sent
 		uint8_t target_type_ = 0;
@@ -111,11 +110,9 @@ class ld2410	{
         uint16_t buffer_head = 0;
         uint16_t buffer_tail = 0;
 
-        // Nuove funzioni private
 		void add_to_buffer(uint8_t byte);
 		bool read_from_buffer(uint8_t &byte);
-        bool find_frame_start();
-        bool check_frame_end_();
+		bool check_frame_end_();
 		
 		bool read_frame_();		
 		bool parse_data_frame_();										//Is the current data frame valid?
