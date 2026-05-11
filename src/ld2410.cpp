@@ -450,11 +450,16 @@ bool ld2410::parse_data_frame_() {
     portENTER_CRITICAL(&data_mux_);
 #endif
     target_type_ = radar_data_frame_[8];
-    moving_target_distance_ = *(uint16_t*)(&radar_data_frame_[9]);
+    // ESP8266 (Xtensa LX106) faults on 16-bit loads from odd addresses, and
+    // offsets 9 and 15 are odd. memcpy compiles to a single unaligned load on
+    // targets that support it (ESP32 / ARM / x86) and to byte loads on those
+    // that don't, so one form works everywhere. LD2410 payloads are little-
+    // endian, matching every supported Arduino target.
+    memcpy(&moving_target_distance_,     &radar_data_frame_[9],  sizeof(uint16_t));
     moving_target_energy_ = radar_data_frame_[11];
-    stationary_target_distance_ = *(uint16_t*)(&radar_data_frame_[12]);
+    memcpy(&stationary_target_distance_, &radar_data_frame_[12], sizeof(uint16_t));
     stationary_target_energy_ = radar_data_frame_[14];
-    detection_distance_ = *(uint16_t*)(&radar_data_frame_[15]);
+    memcpy(&detection_distance_,         &radar_data_frame_[15], sizeof(uint16_t));
 
     // Tabella 14: extra engineering. Layout (full-frame index, 0-based):
     //   17 = max moving gate N (ridondante con max_moving_gate da requestCurrentConfiguration)
